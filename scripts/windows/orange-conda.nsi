@@ -8,7 +8,8 @@
 #  - PY{MAJOR,MINOR,MICRO} Python version to be installed in the new env
 #  - APPNAME Application (short) name
 #  - VER{MAJOR,MINOR,MICRO} Application version
-#  - INSTALL_REGISTRY_KEY reg subkey name to use for storing install infomation
+#  - PYINSTALLER basename of the Miniforge python installer
+#  - INSTALL_REGISTRY_KEY reg subkey name to use for storing install information
 #       (details will be stored under Software/${INSTALL_REGISTRY_KEY})
 
 
@@ -19,7 +20,6 @@
 # ${BASEDIR}/
 #   conda-pkgs/
 #   install.bat
-#   conda-spec.txt
 
 Unicode True
 
@@ -262,10 +262,17 @@ Var StartMenuFolder
 # switch)
 Var SilentInstallDir
 
+# The (env) base Python prefix
+Var BasePythonPrefix
+
 # The created env Python installation layout
 Var PythonPrefix
 Var PythonExecPrefix
 Var PythonScriptsPrefix
+
+# Python installaion mode (1 if installed for all users; 0 if installed for
+# current user only
+Var PythonInstallMode
 
 Var LogFile
 !macro __LOG_INIT
@@ -337,7 +344,8 @@ Function DirectoryLeave
                 MessageBox MB_OK '\
                     "$InstDir" contains a pre-existing environment \
                     that is not binary compatible with this installer.$\r$\n\
-                    Please choose another destination folder.'
+                    Uninstall the existing version of ${APPLICATIONNAME} or \
+                    choose another destination folder.'
                 Abort '$R1 $R2 != "${PYMAJOR}.${PYMINOR} ${PYARCH}"'
             ${EndIf}
             ${LogWrite} 'Found existing python in $InstDir: $R2 - $R3'
@@ -375,25 +383,70 @@ Function RestoreSilentInstallDir
 FunctionEnd
 
 
-# Section Micromamba
-# ------------------
-# A Micromamba executable
-Section "-Micromamba" SectionMicromamba
-    DetailPrint "Installing micromamba.exe"
-    ${ExtractTemp} "${BASEDIR}\micromamba.exe" "$InstDir"
+# Section Miniforge
+# -----------------
+# A Miniforge Python distributions
+Section "Miniforge ${MINIFORGE_VERSION}" \
+        SectionMiniforge
+    ${GetAnyAnacondaInstall} $BasePythonPrefix $PythonInstallMode
+    ${If} $BasePythonPrefix != ""
+        ${LogWrite} "Using exising (Ana|Mini)conda installed in \
+                     $BasePythonPrefix"
+    ${Else}
+        ${ExtractTemp} "${BASEDIR}\${PYINSTALLER}" "${TEMPDIR}"
+        DetailPrint "Installing Miniforge ${MINIFORGE_VERSION}"
+        # Why does executing "${TEMPDIR}\${PYINSTALLER}" directly hang the
+        # Miniforge installer?
+        ${If} ${Silent}
+            StrCpy $0 "/S /AddToPath=0 /RegisterPython=0"
+        ${Else}
+            StrCpy $0 ""
+        ${EndIf}
+        MessageBox MB_OKCANCEL \
+            '${APPLICATIONNAME} requires a Miniforge Python distribution \
+            installed on the system. This will be done by running a separate \
+            installer program.$\r$\n$\r$\n\
+            Click Ok to continue.' \
+            /SD IDOK IDOK continue_miniforge_ IDCANCEL abort_miniforge_
+        abort_miniforge_:
+            Abort "Aborting Miniforge installation (user cancelled)."
+        continue_miniforge_:
+            ${LogWrite} "Running miniforge installer"
+        ${ExecToLog} 'cmd.exe /C "${TEMPDIR}\${PYINSTALLER}" \
+                $0 /InstallationType=$MultiUser.InstallMode \
+            '
+        Pop $0
+        ${If} $0 != 0
+            Abort "Miniforge installation failed (error value: $0)"
+        ${EndIf}
+        ${GetAnyAnacondaInstall} $BasePythonPrefix $PythonInstallMode
+        ${If} $BasePythonPrefix == ""
+            Abort "No anaconda distribution found. Cannot proceed.$\r$\n \
+                   Make sure Miniforge was installed successfully."
+        ${EndIF}
+        ${IfNot} ${FileExists} "$BasePythonPrefix\python.exe"
+            Abort "No python.exe found in $BasePythonPrefix$\r$\n \
+                   Cannot continue."
+        ${EndIf}
+    ${EndIf}
+    ${LogWrite} "Using conda installation: $BasePythonPrefix"
 SectionEnd
 
-Function un.Micromamba
-    Delete "$InstDir\micromamba.exe"
+Function un.Miniforge
+    # Nothing to do. Anaconda installation has its own uninstall.
 FunctionEnd
 
 
-Section "-Micromamba env setup" SectionEnvSetup
+Section "-Miniforge env setup" SectionEnvSetup
     # Setup the PythonPrefix/PythonExecPrefix... variables
     # but does not actualy create any env (this is done in single step
     # in InstallPackages section
-    ${LogWrite} "Using root conda env $InstDir"
-    ${LogWrite} "Configuring to use/create conda env in $InstDir"
+    ${If} $BasePythonPrefix == ""
+        Abort "No base python configured. Cannot proceed."
+    ${EndIf}
+    ${LogWrite} "Using root conda env $BasePythonPrefix"
+    ${LogWrite} "Configuring to use/create conda env in $InstDir \
+                 (using base $BasePythonPrefix)"
 
     StrCpy $PythonPrefix "$InstDir"
     StrCpy $PythonExecPrefix "$PythonPrefix"
@@ -411,6 +464,9 @@ FunctionEnd
 
 Section "Install required packages" InstallPackages
     SectionIn RO
+    ${If} $BasePythonPrefix == ""
+        Abort "No root python executable configured. Cannot proceed."
+    ${EndIf}
     ${If} $PythonPrefix == ""
         Abort "No target python prefix configured. Cannot proceed."
     ${EndIf}
@@ -425,15 +481,12 @@ Section "Install required packages" InstallPackages
 !ifdef ONLINE
         ${ExtractTemp} "${BASEDIR}\conda-spec.txt" "${TEMPDIR}"
 !else
-        ${ExtractTemp} "${BASEDIR}\conda-spec.txt" "${TEMPDIR}"
-        ${ExtractTemp} "${BASEDIR}\install.bat" "${TEMPDIR}"
-        ${ExtractTemp} "${BASEDIR}\sitecustomize.py" "${TEMPDIR}"
-        ${ExtractTempRec} "${BASEDIR}\conda-pkgs\*.*" "$InstDir\pkgs"
+        ${ExtractTempRec} "${BASEDIR}\conda-pkgs\*.*" "${TEMPDIR}\conda-pkgs"
 !endif  # ONLINE
 
     Push $OUTDIR
     SetDetailsPrint none
-    SetOutPath "${TEMPDIR}"
+    SetOutPath "${TEMPDIR}\conda-pkgs"
     SetDetailsPrint both
  !ifdef ONLINE
     # Create an empty env first
@@ -442,17 +495,17 @@ Section "Install required packages" InstallPackages
         # and other things needed to manage the environment. Installing from
         # an explicit package specification file does not do that.
         ${ExecToLog} '\
-            "$InstDir\micromamba.exe" create \
+            "$BasePythonPrefix\python.exe" -m conda create \
                 --yes --quiet --prefix "$PythonPrefix" \
             '
         Pop $0
         ${If} $0 != 0
-            Abort '"micromamba create" exited with $0. Cannot continue.'
+            Abort '"conda create" exited with $0. Cannot continue.'
         ${EndIf}
     ${EndIf}
     DetailPrint "Fetching and installing packages (this might take a while)"
     ${ExecToLog} '\
-        "$InstDir\micromamba.exe" install \
+        "$BasePythonPrefix\python.exe" -m conda install \
             --yes --quiet \
             --file "${TEMPDIR}\conda-spec.txt" \
             --prefix "$PythonPrefix" \
@@ -460,7 +513,13 @@ Section "Install required packages" InstallPackages
 !else
     # Run the install via from a helper script (informative output).
     DetailPrint "Installing packages (this might take a while)"
-    ${ExecToLog} 'cmd.exe /c install.bat "$PythonPrefix" "$InstDir\micromamba.exe"'
+    ${If} ${FileExists} "$BasePythonPrefix\condabin\conda.bat"
+        # Using newer condabin/conda.bat activation wrapper
+        StrCpy $0 "$BasePythonPrefix\condabin\conda.bat"
+    ${Else}
+        StrCpy $0 "$BasePythonPrefix\Scripts\conda.exe"
+    ${EndIf}
+    ${ExecToLog} 'cmd.exe /c install.bat "$PythonPrefix" "$0"'
 !endif # ONLINE
     Pop $0
     SetDetailsPrint none
@@ -476,27 +535,19 @@ SectionEnd
 Function un.InstallPackages
     ${LogWrite} "Removing all installed packages:"
     ${LogWrite} "    installprefix: $InstDir"
-    ${LogWrite} "    root conda prefix: $InstDir"
+    ${LogWrite} "    root conda prefix: $BasePythonPrefix"
     ${If} $InstDir != ""
     ${AndIf} ${FileExists} "$InstDir\${UNINSTALL_EXEFILE}"
         DetailPrint "Removing all packages"
         ${ExecToLog} '\
-            "$InstDir\micromamba.exe" remove \
-                --root-prefix "$InstDir" \
+            "$BasePythonPrefix\python.exe" -m conda remove \
                 --all --yes --prefix "$InstDir" \
             '
         Pop $0
-        ${LogWrite} '"micromamba remove" command exited with $0'
+        ${LogWrite} '"conda remove" command exited with $0'
         ${If} $0 != 0
-            MessageBox MB_OK '"micromamba remove" command exited with an error ($0)'
+            MessageBox MB_OK '"conda remove" command exited with an error ($0)'
         ${EndIf}
-        RMDir /r "$InstDir\pkgs"
-        RMDir /r "$InstDir\condabin"
-        RMDir /r "$InstDir\conda-meta"
-        RMDir /r "$InstDir\Scripts"
-        RMDir /r "$InstDir\Lib"
-        RMDir /r "$InstDir\share"
-        Delete "$InstDir\.condarc"
     ${Else}
         ${LogWrite} '"$InstDir" does not look like an ${APPNAME} installation. \
                      Not removing.'
@@ -522,13 +573,13 @@ Section -Launchers
     # Startup shortcut
     CreateShortCut \
         "$InstDir\${LAUNCHER_SHORTCUT_NAME}.lnk" \
-        "$PythonExecPrefix\pythonw.exe" "-s -m ${LAUNCHERMODULE}" \
+        "$PythonExecPrefix\pythonw.exe" "-Psm ${LAUNCHERMODULE}" \
         "$PythonPrefix\share\${ICONDIR}\${APPICON}" 0
     # Utility shortcut to launch the application with max log level attached
     # to the console that remains visible after exit
     CreateShortCut \
         "$InstDir\${LAUNCHER_SHORTCUT_NAME} Debug.lnk" \
-        "%COMSPEC%" '/K "$PythonExecPrefix\python.exe" -s -m ${LAUNCHERMODULE} -l4' \
+        "%COMSPEC%" '/K "$PythonExecPrefix\python.exe" -Psm ${LAUNCHERMODULE} -l4' \
         "$PythonPrefix\share\${ICONDIR}\${APPICON}" 0
     # A utility shortcut for activating the environment
     CreateShortCut \
@@ -557,7 +608,7 @@ Section "Start Menu Shortcuts" SectionStartMenu
         CreateDirectory "$SMPROGRAMS\$StartMenuFolder"
         CreateShortCut \
             "$SMPROGRAMS\$StartMenuFolder\${LAUNCHER_SHORTCUT_NAME}.lnk" \
-            "$PythonExecPrefix\pythonw.exe" "-s -m ${LAUNCHERMODULE}" \
+            "$PythonExecPrefix\pythonw.exe" "-Psm ${LAUNCHERMODULE}" \
             "$PythonPrefix\share\${ICONDIR}\${APPICON}" 0
 
         # A utility shortcut for activating the environment
@@ -581,7 +632,7 @@ Section "Desktop Shortcuts" SectionDesktop
     DetailPrint "Installing Desktop shortcut"
     CreateShortCut \
         "$DESKTOP\${LAUNCHER_SHORTCUT_NAME}.lnk" \
-        "$PythonExecPrefix\pythonw.exe" "-s -m ${LAUNCHERMODULE}" \
+        "$PythonExecPrefix\pythonw.exe" "-Psm ${LAUNCHERMODULE}" \
         "$PythonPrefix\share\${ICONDIR}\${APPICON}" 0
 SectionEnd
 SectionGroupEnd
@@ -608,9 +659,9 @@ FunctionEnd
 Section -Register SectionRegister
     DetailPrint "Writing to registry"
     ${LogWrite} 'Register installation layout (${INSTALL_SETTINGS_KEY})'
-    ${LogWrite} '    BasePythonPrefix "$InstDir"'
+    ${LogWrite} '    BasePythonPrefix "$BasePythonPrefix"'
     WriteRegStr SHELL_CONTEXT \
-                ${INSTALL_SETTINGS_KEY} BasePythonPrefix "$InstDir"
+                ${INSTALL_SETTINGS_KEY} BasePythonPrefix "$BasePythonPrefix"
     ${LogWrite} '    PythonPrefix "$PythonPrefix"'
     WriteRegStr SHELL_CONTEXT \
                 ${INSTALL_SETTINGS_KEY} PythonPrefix "$PythonPrefix"
@@ -633,7 +684,7 @@ Section -Register SectionRegister
         "$PythonPrefix\share\${ICONDIR}\OrangeOWS.ico"
     WriteRegStr SHELL_CONTEXT \
         "Software\Classes\${INSTALL_REGISTRY_KEY}\Shell\Open\Command\" "" \
-        '"$PythonExecPrefix\pythonw.exe" -s -m ${LAUNCHERMODULE} "%1"'
+        '"$PythonExecPrefix\pythonw.exe" -Psm ${LAUNCHERMODULE} "%1"'
 
     WriteUninstaller "$InstDir\${UNINSTALL_EXEFILE}"
 
@@ -704,10 +755,13 @@ Function un.Register
 FunctionEnd
 
 Function LaunchApplication
-    ExecShell "open" "$PythonExecPrefix\pythonw.exe" "-s -m ${LAUNCHERMODULE}"
+    ExecShell "open" "$PythonExecPrefix\pythonw.exe" "-Psm ${LAUNCHERMODULE}"
 FunctionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+
+!insertmacro MUI_DESCRIPTION_TEXT ${SectionMiniforge} \
+    "Install Miniforge ${MINIFORGE_VERSION} (${BITS} bit)"
 
 !insertmacro MUI_DESCRIPTION_TEXT ${InstallPackages} \
     "Install required packages into the destination environment"
@@ -721,6 +775,7 @@ FunctionEnd
 
 
 Section Uninstall
+    ReadRegStr $BasePythonPrefix SHCTX ${INSTALL_SETTINGS_KEY} BasePythonPrefix
     ReadRegStr $PythonPrefix SHCTX ${INSTALL_SETTINGS_KEY} PythonPrefix
     ReadRegStr $un.InstallDir SHCTX ${INSTALL_SETTINGS_KEY} InstallDir
 
@@ -728,13 +783,14 @@ Section Uninstall
     ${LogWrite} "Layout from registry:"
     ${LogWrite} "    InstallDir: $un.InstallDir"
     ${LogWrite} "    PythonPrefix: $PythonPrefix"
+    ${LogWrite} "    BasePythonPrefix: $BasePythonPrefix"
 
     Call un.Shortcuts
     Call un.Register
     Call un.Launchers
     Call un.InstallPackages
     Call un.Environment
-    Call un.Micromamba
+    Call un.Miniforge
 
     ${If} ${FileExists} "$InstDir\${UNINSTALL_EXEFILE}"
         Delete "$InstDir\${UNINSTALL_EXEFILE}"
@@ -759,6 +815,23 @@ Function .onInit
 
     # Initialize MultiUser.nsh
     !insertmacro MULTIUSER_INIT
+
+    ${GetAnyAnacondaInstall} $BasePythonPrefix  $PythonInstallMode
+    ${LogWrite} "Anaconda Prefix: $BasePythonPrefix"
+    ${LogWrite} "Anaconda Install Type: $PythonInstallMode"
+    ${If} $BasePythonPrefix != ""
+        # Found an appropriate python installation and can reuse it
+        # Change the SectionPython to Unselected
+        # (change text to Install (use) Private Python?)
+        SectionGetText ${SectionMiniforge} $0
+        SectionSetText ${SectionMiniforge} \
+            "Anaconda python distribution (already installed)"
+        !insertmacro UnselectSection ${SectionMiniforge}
+        !insertmacro SetSectionFlag ${SectionMiniforge} ${SF_RO}
+    ${Else}
+        !insertmacro SelectSection ${SectionMiniforge}
+        !insertmacro SetSectionFlag ${SectionMiniforge} ${SF_RO}
+    ${EndIf}
 FunctionEnd
 
 

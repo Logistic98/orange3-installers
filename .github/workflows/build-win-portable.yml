@@ -1,4 +1,4 @@
-name : Build Windows Installer
+name : Build Windows Portable Installer
 
 on:
   pull_request:
@@ -24,7 +24,7 @@ jobs:
       PIP_CACHE_DIR: .pip-cache
       PIP_PREFER_BINARY: 1
 
-      BUILD_DEPS: "wheel~=0.37.0 pip~=22.0.3"
+      BUILD_DEPS: "wheel~=0.37.0 pip~=23.2.1"
       ENVSPEC: ./specs/win/requirements.txt
 
     strategy:
@@ -34,7 +34,7 @@ jobs:
           - python-version: "3.11.8"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -54,7 +54,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .pip-cache
-          key: ${{ runner.os }}-py-${{ matrix.python-version }}-pip-${{ hashFiles('.github/workflows/build-win-installer.yml') }}
+          key: ${{ runner.os }}-py-${{ matrix.python-version }}-pip-${{ hashFiles('.github/workflows/build-win-portable.yml') }}
           restore-keys: |
             ${{ runner.os }}-py-${{ matrix.python-version }}-pip
 
@@ -74,17 +74,14 @@ jobs:
         shell: bash
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
-          PLATTAG: win_amd64
         run: |
+          export PATH="$(cygpath -u C:\\msys64\\usr\\bin):$PATH"
           echo PATH=$PATH
           mkdir dist
-          ./scripts/windows/build-win-installer.sh  \
-               --no-index --find-links=./wheels \
-               --python-version $PYTHON_VERSION \
-               --platform $PLATTAG \
-               --pip-arg=--pre --pip-arg=-r --pip-arg=$ENVSPEC --pip-arg=Orange3
+          
+          ./scripts/windows/build-win-portable.sh  --no-index --find-links=./wheels  --python-version $PYTHON_VERSION --pip-arg=--pre --pip-arg=-r --pip-arg=$ENVSPEC --pip-arg=Orange3
 
-          INSTALLER=( dist/Orange3*.exe )
+          INSTALLER=( dist/Orange*.zip )
           SHA256=$( sha256sum -b $INSTALLER )
           echo INSTALLER = $INSTALLER
           echo SHA256 = $( sha256sum -b $INSTALLER )
@@ -92,8 +89,8 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: orange-win-installer
-          path: dist/Orange3-*.exe
+          name: orange-win-portable-installer
+          path: dist/Orange*.zip
           if-no-files-found: error
 
   test:
@@ -104,20 +101,16 @@ jobs:
       - name: Download installer
         uses: actions/download-artifact@v4
         with:
-          name: orange-win-installer
+          name: orange-win-portable-installer
 
       - name: Install
-        shell: cmd
+        shell: bash
         run: |
-          rem # Install in silent mode. Output has to be piped somewhere so the installer
-          rem # runs 'attached' to the console.
-          for %%s in ( Orange3*.exe ) do ( set "INSTALLER=%%s" )
-          echo INSTALLER = %INSTALLER%
-          %INSTALLER% /S /D=D:\test-install > nul
+          7z x "-oD:\\test-install" Orange*.zip
       - name: Run tests
         shell: bash
         run: |
-          PYTHON=$(cygpath -u 'D:\test-install\python')
+          PYTHON=$(cygpath -u "D:\\test-install\\Orange\\python.exe")
           $PYTHON --version
           $PYTHON -m pip --version
           $PYTHON -m pip list --format=freeze
